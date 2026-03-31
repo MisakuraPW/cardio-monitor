@@ -1,0 +1,24 @@
+﻿name: cardio_upper_computer
+description: Multi-source cardiopulmonary monitoring upper computer built with Flutter Web.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  file_picker: any
+  http: any
+  mqtt_client: any
+  uuid: any
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: any
+
+flutter:
+  uses-material-design: true

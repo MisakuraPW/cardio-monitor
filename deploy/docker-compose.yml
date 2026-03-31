@@ -1,0 +1,37 @@
+﻿version: "3.9"
+
+services:
+  cloud_api:
+    build:
+      context: ../cloud_server
+    container_name: cardio-cloud-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ../cloud_server/data:/app/data
+    ports:
+      - "8000:8000"
+
+  cloud_worker:
+    build:
+      context: ../cloud_server
+    container_name: cardio-cloud-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker_loop"]
+    env_file:
+      - .env
+    volumes:
+      - ../cloud_server/data:/app/data
+    depends_on:
+      - cloud_api
+
+  admin_web:
+    build:
+      context: ../admin_web
+    container_name: cardio-admin-web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - cloud_api

@@ -1,0 +1,16 @@
+.dart_tool/
+.idea/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub/
+.pub-cache/
+build/
+coverage/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+cloud_server/data/
+

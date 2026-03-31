@@ -1,0 +1,46 @@
+{
+  "deviceId": "file-demo-01",
+  "sessionId": "file-session-01",
+  "channels": [
+    {
+      "key": "ecg",
+      "label": "ECG",
+      "unit": "mV",
+      "sampleRate": 250,
+      "colorHex": "#F25F5C",
+      "enabled": true
+    },
+    {
+      "key": "ppg",
+      "label": "PPG",
+      "unit": "a.u.",
+      "sampleRate": 100,
+      "colorHex": "#247BA0",
+      "enabled": true
+    }
+  ],
+  "frames": [
+    {
+      "deviceId": "file-demo-01",
+      "sessionId": "file-session-01",
+      "seq": 1,
+      "timestampMs": 1711780800000,
+      "channelKey": "ecg",
+      "sampleRate": 250,
+      "unit": "mV",
+      "quality": 0.95,
+      "samples": [0.02, 0.04, 0.08, 0.46, 0.92]
+    },
+    {
+      "deviceId": "file-demo-01",
+      "sessionId": "file-session-01",
+      "seq": 2,
+      "timestampMs": 1711780800000,
+      "channelKey": "ppg",
+      "sampleRate": 100,
+      "unit": "a.u.",
+      "quality": 0.93,
+      "samples": [0.42, 0.43, 0.44, 0.46, 0.49]
+    }
+  ]
+}
