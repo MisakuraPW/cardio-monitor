@@ -266,7 +266,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 _controller.updateBluetoothConfig(controlCharacteristicUuid: value);
               }),
               const SizedBox(height: 8),
-              const Text('蓝牙模式基于 Web Bluetooth，只能在 Chrome / Edge 的 HTTPS 或 localhost 环境下使用。'),
+              const Text('蓝牙模式基于 Web Bluetooth，默认按 esp32-bio 设备名前缀筛选，并按 BIO1 二进制帧解析 Notify 数据。页面仍需运行在 Chrome / Edge 的 HTTPS 或 localhost 环境下。'),
             ],
             const SizedBox(height: 16),
             Row(

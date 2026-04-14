@@ -46,7 +46,7 @@ class MqttAdapterConfig {
 
 class BluetoothAdapterConfig {
   BluetoothAdapterConfig({
-    this.deviceNamePrefix = 'CardioESP32',
+    this.deviceNamePrefix = 'esp32-bio',
     this.serviceUuid = 'c0ad0001-8d2b-4d6f-9a1c-1c8a52f0a001',
     this.notifyCharacteristicUuid = 'c0ad1001-8d2b-4d6f-9a1c-1c8a52f0a001',
     this.controlCharacteristicUuid = 'c0ad1002-8d2b-4d6f-9a1c-1c8a52f0a001',
@@ -603,8 +603,10 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
   dynamic _controlCharacteristic;
   dynamic _notificationCallback;
   dynamic _disconnectCallback;
-  String _receiveBuffer = '';
+  final List<int> _receiveBuffer = <int>[];
   List<ChannelDescriptor> _currentCatalog = const <ChannelDescriptor>[];
+  String _deviceId = 'esp32-bio';
+  String _sessionId = 'ble-session';
 
   @override
   Stream<SignalFrame> get streamFrames => _frameController.stream;
@@ -683,21 +685,15 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
         <dynamic>['characteristicvaluechanged', _notificationCallback],
       );
 
-      final deviceName = (js_util.getProperty(_device, 'name') ?? '未知设备').toString();
-      _emitStatus(AdapterState.streaming, '蓝牙已连接: $deviceName');
-
-      await sendControl(
-        ControlCommand(
-          type: 'hello',
-          payload: <String, dynamic>{
-            'client': 'flutter_web',
-            'requestedAt': DateTime.now().toUtc().toIso8601String(),
-          },
-        ),
-      );
-      await sendControl(
-        const ControlCommand(type: 'get_catalog', payload: <String, dynamic>{}),
-      );
+      _receiveBuffer.clear();
+      _currentCatalog = const <ChannelDescriptor>[];
+      final deviceName =
+          (js_util.getProperty(_device, 'name') ?? config.deviceNamePrefix)
+              .toString()
+              .trim();
+      _deviceId = deviceName.isEmpty ? config.deviceNamePrefix : deviceName;
+      _sessionId = 'ble-${DateTime.now().millisecondsSinceEpoch}';
+      _emitStatus(AdapterState.streaming, '蓝牙已连接: $_deviceId，等待 BIO1 二进制数据...');
     } catch (error) {
       _emitStatus(AdapterState.error, '蓝牙连接失败: $error');
       rethrow;
@@ -730,23 +726,87 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
     for (var index = 0; index < length; index++) {
       bytes[index] = (js_util.callMethod(value, 'getUint8', <dynamic>[index]) as num).toInt();
     }
+    _receiveBuffer.addAll(bytes);
+    _drainReceiveBuffer();
+  }
 
-    _receiveBuffer += utf8.decode(bytes, allowMalformed: true);
-    while (true) {
-      final newlineIndex = _receiveBuffer.indexOf('\n');
-      if (newlineIndex < 0) {
-        break;
+  void _drainReceiveBuffer() {
+    while (_receiveBuffer.isNotEmpty) {
+      while (_receiveBuffer.isNotEmpty &&
+          (_receiveBuffer.first == 0x0A || _receiveBuffer.first == 0x0D)) {
+        _receiveBuffer.removeAt(0);
       }
-      final line = _receiveBuffer.substring(0, newlineIndex).trim();
-      _receiveBuffer = _receiveBuffer.substring(newlineIndex + 1);
-      if (line.isNotEmpty) {
-        _handleBleLine(line);
+      if (_receiveBuffer.isEmpty) {
+        return;
+      }
+      if (_receiveBuffer.first == 0x7B) {
+        if (!_tryConsumeJsonLine()) {
+          return;
+        }
+        continue;
+      }
+      if (!_tryConsumeBinaryFrame()) {
+        return;
       }
     }
   }
 
+  bool _tryConsumeJsonLine() {
+    final newlineIndex = _receiveBuffer.indexOf(0x0A);
+    if (newlineIndex < 0) {
+      return false;
+    }
+    final lineBytes = _receiveBuffer.sublist(0, newlineIndex);
+    _receiveBuffer.removeRange(0, newlineIndex + 1);
+    final line = utf8.decode(lineBytes, allowMalformed: true).trim();
+    if (line.isNotEmpty) {
+      _handleBleLine(line);
+    }
+    return true;
+  }
+
+  bool _tryConsumeBinaryFrame() {
+    final magicIndex = _indexOfMagic(_receiveBuffer);
+    if (magicIndex < 0) {
+      if (_receiveBuffer.length > 3) {
+        _receiveBuffer.removeRange(0, _receiveBuffer.length - 3);
+      }
+      return false;
+    }
+    if (magicIndex > 0) {
+      _receiveBuffer.removeRange(0, magicIndex);
+    }
+    if (_receiveBuffer.length < 11) {
+      return false;
+    }
+
+    final typeByte = _receiveBuffer[4];
+    final sampleSize = _sampleSizeForType(typeByte);
+    if (sampleSize == null) {
+      _receiveBuffer.removeAt(0);
+      return true;
+    }
+
+    final header = ByteData.sublistView(Uint8List.fromList(_receiveBuffer.sublist(0, 11)));
+    final sampleCount = header.getUint16(9, Endian.little);
+    final frameLength = 11 + sampleCount * sampleSize;
+    if (_receiveBuffer.length < frameLength) {
+      return false;
+    }
+
+    final frameBytes = Uint8List.fromList(_receiveBuffer.sublist(0, frameLength));
+    _receiveBuffer.removeRange(0, frameLength);
+    _handleBinaryFrame(frameBytes);
+    return true;
+  }
+
   void _handleBleLine(String line) {
-    final dynamic decoded = jsonDecode(line);
+    dynamic decoded;
+    try {
+      decoded = jsonDecode(line);
+    } catch (_) {
+      return;
+    }
     if (decoded is! Map<String, dynamic>) {
       return;
     }
@@ -754,12 +814,10 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
     final type = (decoded['type'] ?? '').toString();
     final payload = decoded['payload'];
     if (type == 'catalog' && payload is Map<String, dynamic>) {
-      final rawChannels =
-          (payload['channels'] as List<dynamic>? ?? const <dynamic>[]);
+      final rawChannels = (payload['channels'] as List<dynamic>? ?? const <dynamic>[]);
       _currentCatalog = rawChannels
           .map(
-            (dynamic item) =>
-                ChannelDescriptor.fromJson(item as Map<String, dynamic>),
+            (dynamic item) => ChannelDescriptor.fromJson(item as Map<String, dynamic>),
           )
           .toList();
       _catalogController.add(List<ChannelDescriptor>.from(_currentCatalog));
@@ -787,6 +845,325 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
     if (decoded.containsKey('channelKey')) {
       _frameController.add(SignalFrame.fromJson(decoded));
     }
+  }
+
+  void _handleBinaryFrame(Uint8List frameBytes) {
+    final data = ByteData.sublistView(frameBytes);
+    final typeCode = String.fromCharCode(frameBytes[4]);
+    final seq = data.getUint32(5, Endian.little);
+    final sampleCount = data.getUint16(9, Endian.little);
+    final sampleSize = _sampleSizeForType(frameBytes[4]);
+    if (sampleSize == null || sampleCount == 0) {
+      return;
+    }
+
+    switch (typeCode) {
+      case 'E':
+        _handleBinaryEcgFrame(data, seq, sampleCount, sampleSize);
+        return;
+      case 'P':
+        _handleBinaryPpgFrame(data, seq, sampleCount, sampleSize);
+        return;
+      case 'I':
+        _handleBinaryImuFrame(data, seq, sampleCount, sampleSize);
+        return;
+      default:
+        return;
+    }
+  }
+
+  void _handleBinaryEcgFrame(
+    ByteData data,
+    int seq,
+    int sampleCount,
+    int sampleSize,
+  ) {
+    final timestampsUs = <int>[];
+    final values = <double>[];
+    for (var index = 0; index < sampleCount; index++) {
+      final offset = 11 + index * sampleSize;
+      timestampsUs.add(_readUint64Le(data, offset));
+      values.add(data.getUint16(offset + 8, Endian.little).toDouble());
+    }
+
+    final sampleRate = _estimateSampleRate(timestampsUs, 500);
+    _mergeCatalog(<ChannelDescriptor>[
+      _buildChannelDescriptor(
+        key: 'ecg',
+        label: 'ECG',
+        unit: 'adc',
+        colorHex: '#F25F5C',
+        sampleRate: sampleRate,
+      ),
+    ]);
+    _emitSignalFrame(
+      channelKey: 'ecg',
+      seq: seq,
+      unit: 'adc',
+      sampleRate: sampleRate,
+      timestampUs: timestampsUs.first,
+      samples: values,
+    );
+  }
+
+  void _handleBinaryPpgFrame(
+    ByteData data,
+    int seq,
+    int sampleCount,
+    int sampleSize,
+  ) {
+    final timestampsUs = <int>[];
+    final irValues = <double>[];
+    final redValues = <double>[];
+    for (var index = 0; index < sampleCount; index++) {
+      final offset = 11 + index * sampleSize;
+      timestampsUs.add(_readUint64Le(data, offset));
+      irValues.add(data.getUint32(offset + 8, Endian.little).toDouble());
+      redValues.add(data.getUint32(offset + 12, Endian.little).toDouble());
+    }
+
+    final sampleRate = _estimateSampleRate(timestampsUs, 100);
+    _mergeCatalog(<ChannelDescriptor>[
+      _buildChannelDescriptor(
+        key: 'ppg_ir',
+        label: 'PPG IR',
+        unit: 'count',
+        colorHex: '#247BA0',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'ppg_red',
+        label: 'PPG RED',
+        unit: 'count',
+        colorHex: '#C84C5A',
+        sampleRate: sampleRate,
+      ),
+    ]);
+    _emitSignalFrame(
+      channelKey: 'ppg_ir',
+      seq: seq,
+      unit: 'count',
+      sampleRate: sampleRate,
+      timestampUs: timestampsUs.first,
+      samples: irValues,
+    );
+    _emitSignalFrame(
+      channelKey: 'ppg_red',
+      seq: seq,
+      unit: 'count',
+      sampleRate: sampleRate,
+      timestampUs: timestampsUs.first,
+      samples: redValues,
+    );
+  }
+
+  void _handleBinaryImuFrame(
+    ByteData data,
+    int seq,
+    int sampleCount,
+    int sampleSize,
+  ) {
+    final timestampsUs = <int>[];
+    final channelSamples = <String, List<double>>{
+      'imu_ax': <double>[],
+      'imu_ay': <double>[],
+      'imu_az': <double>[],
+      'imu_gx': <double>[],
+      'imu_gy': <double>[],
+      'imu_gz': <double>[],
+    };
+    for (var index = 0; index < sampleCount; index++) {
+      final offset = 11 + index * sampleSize;
+      timestampsUs.add(_readUint64Le(data, offset));
+      channelSamples['imu_ax']!.add(data.getInt16(offset + 8, Endian.little).toDouble());
+      channelSamples['imu_ay']!.add(data.getInt16(offset + 10, Endian.little).toDouble());
+      channelSamples['imu_az']!.add(data.getInt16(offset + 12, Endian.little).toDouble());
+      channelSamples['imu_gx']!.add(data.getInt16(offset + 14, Endian.little).toDouble());
+      channelSamples['imu_gy']!.add(data.getInt16(offset + 16, Endian.little).toDouble());
+      channelSamples['imu_gz']!.add(data.getInt16(offset + 18, Endian.little).toDouble());
+    }
+
+    final sampleRate = _estimateSampleRate(timestampsUs, 100);
+    _mergeCatalog(<ChannelDescriptor>[
+      _buildChannelDescriptor(
+        key: 'imu_ax',
+        label: 'IMU AX',
+        unit: 'raw',
+        colorHex: '#2A9D8F',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'imu_ay',
+        label: 'IMU AY',
+        unit: 'raw',
+        colorHex: '#36B7A1',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'imu_az',
+        label: 'IMU AZ',
+        unit: 'raw',
+        colorHex: '#55C7AE',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'imu_gx',
+        label: 'IMU GX',
+        unit: 'raw',
+        colorHex: '#7B6DFF',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'imu_gy',
+        label: 'IMU GY',
+        unit: 'raw',
+        colorHex: '#9A7CFF',
+        sampleRate: sampleRate,
+      ),
+      _buildChannelDescriptor(
+        key: 'imu_gz',
+        label: 'IMU GZ',
+        unit: 'raw',
+        colorHex: '#B792FF',
+        sampleRate: sampleRate,
+      ),
+    ]);
+    for (final entry in channelSamples.entries) {
+      _emitSignalFrame(
+        channelKey: entry.key,
+        seq: seq,
+        unit: 'raw',
+        sampleRate: sampleRate,
+        timestampUs: timestampsUs.first,
+        samples: entry.value,
+      );
+    }
+  }
+
+  void _emitSignalFrame({
+    required String channelKey,
+    required int seq,
+    required String unit,
+    required double sampleRate,
+    required int timestampUs,
+    required List<double> samples,
+  }) {
+    _frameController.add(
+      SignalFrame(
+        deviceId: _deviceId,
+        sessionId: _sessionId,
+        seq: seq,
+        timestampMs: timestampUs ~/ 1000,
+        channelKey: channelKey,
+        sampleRate: sampleRate,
+        unit: unit,
+        quality: 1.0,
+        samples: samples,
+      ),
+    );
+  }
+
+  void _mergeCatalog(List<ChannelDescriptor> incoming) {
+    var changed = false;
+    final nextCatalog = List<ChannelDescriptor>.from(_currentCatalog);
+    for (final descriptor in incoming) {
+      final index = nextCatalog.indexWhere((ChannelDescriptor item) => item.key == descriptor.key);
+      if (index < 0) {
+        nextCatalog.add(descriptor);
+        changed = true;
+        continue;
+      }
+      final existing = nextCatalog[index];
+      final updated = existing.copyWith(
+        label: descriptor.label,
+        unit: descriptor.unit,
+        sampleRate: descriptor.sampleRate > 0 ? descriptor.sampleRate : existing.sampleRate,
+        colorHex: descriptor.colorHex,
+      );
+      if (updated.label != existing.label ||
+          updated.unit != existing.unit ||
+          updated.sampleRate != existing.sampleRate ||
+          updated.colorHex != existing.colorHex) {
+        nextCatalog[index] = updated;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      return;
+    }
+    _currentCatalog = nextCatalog;
+    _catalogController.add(List<ChannelDescriptor>.from(_currentCatalog));
+    _emitStatus(AdapterState.streaming, '已识别 ${_currentCatalog.length} 个蓝牙二进制通道');
+  }
+
+  ChannelDescriptor _buildChannelDescriptor({
+    required String key,
+    required String label,
+    required String unit,
+    required String colorHex,
+    required double sampleRate,
+  }) {
+    final existingIndex =
+        _currentCatalog.indexWhere((ChannelDescriptor item) => item.key == key);
+    final existing = existingIndex >= 0 ? _currentCatalog[existingIndex] : null;
+    return ChannelDescriptor(
+      key: key,
+      label: label,
+      unit: unit,
+      sampleRate: sampleRate,
+      colorHex: colorHex,
+      enabled: existing?.enabled ?? true,
+    );
+  }
+
+  int? _sampleSizeForType(int typeByte) {
+    switch (String.fromCharCode(typeByte)) {
+      case 'E':
+        return 12;
+      case 'P':
+        return 16;
+      case 'I':
+        return 20;
+      default:
+        return null;
+    }
+  }
+
+  int _indexOfMagic(List<int> buffer) {
+    for (var index = 0; index <= buffer.length - 4; index++) {
+      if (buffer[index] == 0x42 &&
+          buffer[index + 1] == 0x49 &&
+          buffer[index + 2] == 0x4F &&
+          buffer[index + 3] == 0x31) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  int _readUint64Le(ByteData data, int offset) {
+    final low = data.getUint32(offset, Endian.little);
+    final high = data.getUint32(offset + 4, Endian.little);
+    return high * 0x100000000 + low;
+  }
+
+  double _estimateSampleRate(List<int> timestampsUs, double fallback) {
+    if (timestampsUs.length < 2) {
+      return fallback;
+    }
+    var totalDelta = 0;
+    var count = 0;
+    for (var index = 1; index < timestampsUs.length; index++) {
+      final delta = timestampsUs[index] - timestampsUs[index - 1];
+      if (delta > 0) {
+        totalDelta += delta;
+        count++;
+      }
+    }
+    if (count == 0 || totalDelta <= 0) {
+      return fallback;
+    }
+    return 1000000.0 / (totalDelta / count);
   }
 
   @override
@@ -836,7 +1213,10 @@ class BluetoothDataSourceAdapter implements DataSourceAdapter {
     _controlCharacteristic = null;
     _notificationCallback = null;
     _disconnectCallback = null;
-    _receiveBuffer = '';
+    _receiveBuffer.clear();
+    _currentCatalog = const <ChannelDescriptor>[];
+    _deviceId = config.deviceNamePrefix;
+    _sessionId = 'ble-session';
     _emitStatus(AdapterState.disconnected, '蓝牙连接已关闭');
   }
 
@@ -913,4 +1293,5 @@ class _NormalizedChannel {
   final String label;
   final String unit;
 }
+
 

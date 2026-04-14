@@ -42,6 +42,7 @@ cmd /c npm.cmd run dev
 - [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)：整体实现计划
 - [docs/protocol.md](./docs/protocol.md)：主题、消息格式、文件回放格式
 - [docs/esp32_communication_protocol.md](./docs/esp32_communication_protocol.md)：ESP32 协议说明
+- [docs/esp32_ble_connection_guide.md](./docs/esp32_ble_connection_guide.md)：上位机与 ESP32 蓝牙连接说明
 - [docs/cloud_system_guide.md](./docs/cloud_system_guide.md)：云端系统实现讲解与部署建议
 - [docs/opencloudos_deployment_manual.md](./docs/opencloudos_deployment_manual.md)：OpenCloudOS 9.4 服务器逐条命令部署手册
 - [deploy/README.md](./deploy/README.md)：容器化部署骨架说明
