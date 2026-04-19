@@ -1,5 +1,6 @@
 .dart_tool/
 .idea/
+.vscode/
 .packages
 .flutter-plugins
 .flutter-plugins-dependencies
@@ -10,7 +11,28 @@ coverage/
 __pycache__/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .venv/
 venv/
+
+# Local environment files
+deploy/.env
+cloud_server/.env
+cloud_server/.venv/
 cloud_server/data/
 
+# Frontend build artifacts
+admin_web/node_modules/
+admin_web/dist/
+admin_web/.env.local
+admin_web/.env.*.local
+
+# Flutter project outputs
+flutter_app/build/
+flutter_app/.dart_tool/
+flutter_app/.flutter-plugins
+flutter_app/.flutter-plugins-dependencies
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

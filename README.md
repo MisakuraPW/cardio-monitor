@@ -45,4 +45,5 @@ cmd /c npm.cmd run dev
 - [docs/esp32_ble_connection_guide.md](./docs/esp32_ble_connection_guide.md)：上位机与 ESP32 蓝牙连接说明
 - [docs/cloud_system_guide.md](./docs/cloud_system_guide.md)：云端系统实现讲解与部署建议
 - [docs/opencloudos_deployment_manual.md](./docs/opencloudos_deployment_manual.md)：OpenCloudOS 9.4 服务器逐条命令部署手册
+- [docs/git_setup_and_server_update_guide.md](./docs/git_setup_and_server_update_guide.md)：Git 接入、`.gitignore` 模板与服务器增量更新手册
 - [deploy/README.md](./deploy/README.md)：容器化部署骨架说明
