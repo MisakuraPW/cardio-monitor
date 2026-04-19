@@ -316,6 +316,26 @@ class SamplePoint {
   final double value;
 }
 
+class WaveformSlice {
+  const WaveformSlice({
+    required this.points,
+    required this.minValue,
+    required this.maxValue,
+  });
+
+  static const WaveformSlice empty = WaveformSlice(
+    points: <SamplePoint>[],
+    minValue: 0,
+    maxValue: 0,
+  );
+
+  final List<SamplePoint> points;
+  final double minValue;
+  final double maxValue;
+
+  bool get isEmpty => points.isEmpty;
+}
+
 class HoverSampleInfo {
   const HoverSampleInfo({
     required this.sample,

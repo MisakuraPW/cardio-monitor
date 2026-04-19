@@ -57,6 +57,7 @@ class MonitorController extends ChangeNotifier {
   double secondsPerScreen = 8;
   double historyOffsetSeconds = 0;
   double gain = 1;
+  double liveDisplayLagSeconds = 5;
 
   String cloudBaseUrl = 'http://127.0.0.1:8000';
 
@@ -72,9 +73,7 @@ class MonitorController extends ChangeNotifier {
   bool get canRollbackHistory => isPaused && maxHistoryOffsetSeconds > 0.05;
 
   int get currentAnchorTimestampMs {
-    final liveBase = latestTimestampMs == 0
-        ? DateTime.now().millisecondsSinceEpoch
-        : latestTimestampMs;
+    final liveBase = _liveAnchorTimestampMs();
     if (!isPaused) {
       return liveBase;
     }
@@ -257,6 +256,17 @@ class MonitorController extends ChangeNotifier {
     _scheduleNotify();
   }
 
+  void setLiveDisplayLagSeconds(double value) {
+    liveDisplayLagSeconds = value;
+    if (isPaused) {
+      historyOffsetSeconds = historyOffsetSeconds.clamp(
+        0.0,
+        maxHistoryOffsetSeconds,
+      );
+    }
+    _scheduleNotify();
+  }
+
   void togglePause() {
     if (isPaused) {
       isPaused = false;
@@ -266,9 +276,7 @@ class MonitorController extends ChangeNotifier {
     } else {
       isPaused = true;
       historyOffsetSeconds = 0;
-      _pauseReferenceTimestampMs = latestTimestampMs == 0
-          ? DateTime.now().millisecondsSinceEpoch
-          : latestTimestampMs;
+      _pauseReferenceTimestampMs = currentAnchorTimestampMs;
       _pushEvent('已暂停实时播放，可自由回滚查看历史波形');
     }
     _scheduleNotify();
@@ -276,8 +284,8 @@ class MonitorController extends ChangeNotifier {
 
   double get maxHistoryOffsetSeconds {
     final reference = isPaused
-        ? (_pauseReferenceTimestampMs ?? latestTimestampMs)
-        : latestTimestampMs;
+        ? (_pauseReferenceTimestampMs ?? _liveAnchorTimestampMs())
+        : _liveAnchorTimestampMs();
     if (_buffers.isEmpty || reference == 0) {
       return 0;
     }
@@ -293,15 +301,19 @@ class MonitorController extends ChangeNotifier {
     return math.max(0, span / 1000 - secondsPerScreen).toDouble();
   }
 
-  List<SamplePoint> visiblePoints(String channelKey) {
+  WaveformSlice visibleWaveform(String channelKey) {
     final buffer = _buffers[channelKey];
     if (buffer == null) {
-      return const <SamplePoint>[];
+      return WaveformSlice.empty;
     }
-    return buffer.visiblePoints(
+    return buffer.visibleWaveform(
       anchorMs: currentAnchorTimestampMs,
       windowMs: (secondsPerScreen * 1000).round(),
     );
+  }
+
+  List<SamplePoint> visiblePoints(String channelKey) {
+    return visibleWaveform(channelKey).points;
   }
 
   Map<String, dynamic> channelSummary(String channelKey) {
@@ -607,7 +619,32 @@ class MonitorController extends ChangeNotifier {
     if (_notifyTimer?.isActive ?? false) {
       return;
     }
-    _notifyTimer = Timer(const Duration(milliseconds: 48), notifyListeners);
+    _notifyTimer = Timer(const Duration(milliseconds: 24), notifyListeners);
+  }
+
+  int _liveAnchorTimestampMs() {
+    final liveBase = latestTimestampMs == 0
+        ? DateTime.now().millisecondsSinceEpoch
+        : latestTimestampMs;
+    final delayedBase = liveBase - (liveDisplayLagSeconds * 1000).round();
+    final synchronizedLatest = _slowestVisibleLatestTimestampMs();
+    if (synchronizedLatest == null) {
+      return delayedBase;
+    }
+    return math.min(delayedBase, synchronizedLatest);
+  }
+
+  int? _slowestVisibleLatestTimestampMs() {
+    final candidates = visibleChannels
+        .map((ChannelDescriptor item) => _buffers[item.key])
+        .whereType<WaveformBuffer>()
+        .where((WaveformBuffer item) => item.hasPoints)
+        .map((WaveformBuffer item) => item.latestPointTimestampMs)
+        .toList();
+    if (candidates.isEmpty) {
+      return null;
+    }
+    return candidates.reduce(math.min);
   }
 
   @override
@@ -629,15 +666,22 @@ class WaveformBuffer {
 
   final String channelKey;
   final List<SamplePoint> _points = <SamplePoint>[];
+  int _startIndex = 0;
   double _qualityWeighted = 0;
   int _qualitySamples = 0;
   double _sum = 0;
   double _sumSquares = 0;
   double _min = 0;
   double _max = 0;
+  Map<String, dynamic>? _cachedSummary;
+  bool _summaryDirty = true;
+  double? _cachedRateBpm;
+  int _lastRateEstimateTimestampMs = 0;
 
-  bool get hasPoints => _points.isNotEmpty;
-  int get oldestTimestampMs => _points.isEmpty ? 0 : _points.first.timestampMs;
+  bool get hasPoints => activeLength > 0;
+  int get oldestTimestampMs => hasPoints ? _points[_startIndex].timestampMs : 0;
+  int get latestPointTimestampMs => hasPoints ? _points.last.timestampMs : 0;
+  int get activeLength => _points.length - _startIndex;
 
   void appendFrame(SignalFrame frame) {
     final stepMs = frame.sampleRate <= 0 ? 1 : (1000 / frame.sampleRate).round();
@@ -653,35 +697,69 @@ class WaveformBuffer {
     _trim();
   }
 
-  List<SamplePoint> visiblePoints({
+  WaveformSlice visibleWaveform({
     required int anchorMs,
     required int windowMs,
   }) {
-    if (_points.isEmpty) {
-      return const <SamplePoint>[];
+    if (!hasPoints) {
+      return WaveformSlice.empty;
     }
     final start = anchorMs - windowMs;
-    return _points
-        .where(
-          (SamplePoint point) =>
-              point.timestampMs >= start && point.timestampMs <= anchorMs,
-        )
-        .toList();
+    final firstVisibleIndex = _lowerBound(start);
+    final endExclusive = _upperBound(anchorMs);
+    if (firstVisibleIndex >= endExclusive) {
+      return WaveformSlice.empty;
+    }
+
+    var minValue = _points[firstVisibleIndex].value;
+    var maxValue = minValue;
+    final visible = List<SamplePoint>.generate(
+      endExclusive - firstVisibleIndex,
+      (int offset) {
+        final point = _points[firstVisibleIndex + offset];
+        if (offset > 0) {
+          minValue = math.min(minValue, point.value);
+          maxValue = math.max(maxValue, point.value);
+        }
+        return point;
+      },
+      growable: false,
+    );
+
+    return WaveformSlice(
+      points: visible,
+      minValue: minValue,
+      maxValue: maxValue,
+    );
   }
 
   Map<String, dynamic> summary() {
-    if (_points.isEmpty) {
+    if (!hasPoints) {
       return const <String, dynamic>{};
     }
-    final sampleCount = _points.length;
+    if (!_summaryDirty && _cachedSummary != null) {
+      return _cachedSummary!;
+    }
+
+    final sampleCount = activeLength;
     final mean = _sum / sampleCount;
     final rms = math.sqrt(_sumSquares / sampleCount);
     final variance = math.max(0, (_sumSquares / sampleCount) - mean * mean);
     final stdDev = math.sqrt(variance);
-    final durationSeconds =
-        (_points.last.timestampMs - _points.first.timestampMs) / 1000.0;
+    final durationSeconds = sampleCount <= 1
+        ? 0.0
+        : (latestPointTimestampMs - oldestTimestampMs) / 1000.0;
+    final latestTimestampMs = latestPointTimestampMs;
+    if (_cachedRateBpm == null ||
+        latestTimestampMs - _lastRateEstimateTimestampMs >= 500) {
+      _cachedRateBpm = _estimateRateBpm(
+        mean: mean,
+        durationSeconds: durationSeconds,
+      );
+      _lastRateEstimateTimestampMs = latestTimestampMs;
+    }
 
-    return <String, dynamic>{
+    final summary = <String, dynamic>{
       'samples': sampleCount,
       'min': _min,
       'max': _max,
@@ -691,19 +769,22 @@ class WaveformBuffer {
       'peakToPeak': _max - _min,
       'durationSeconds': durationSeconds,
       'meanQuality': _qualitySamples == 0 ? 0 : _qualityWeighted / _qualitySamples,
-      'estimatedRateBpm': _estimateRateBpm(mean: mean, durationSeconds: durationSeconds),
+      'estimatedRateBpm': _cachedRateBpm,
     };
+    _cachedSummary = summary;
+    _summaryDirty = false;
+    return summary;
   }
 
   List<double> tailValues({required int maxItems}) {
-    final tail = _points.length <= maxItems
-        ? _points
-        : _points.sublist(_points.length - maxItems);
+    final length = activeLength;
+    final start = length <= maxItems ? _startIndex : _points.length - maxItems;
+    final tail = _points.sublist(start);
     return tail.map((SamplePoint item) => item.value).toList();
   }
 
   void _appendPoint(SamplePoint point) {
-    if (_points.isEmpty) {
+    if (!hasPoints) {
       _min = point.value;
       _max = point.value;
     } else {
@@ -713,10 +794,11 @@ class WaveformBuffer {
     _sum += point.value;
     _sumSquares += point.value * point.value;
     _points.add(point);
+    _summaryDirty = true;
   }
 
   double? _estimateRateBpm({required double mean, required double durationSeconds}) {
-    if (_points.length < 20 || durationSeconds < 3) {
+    if (activeLength < 20 || durationSeconds < 3) {
       return null;
     }
 
@@ -728,8 +810,9 @@ class WaveformBuffer {
     final threshold = mean + dynamicRange * 0.28;
     const minPeakDistanceMs = 280;
     final peakTimes = <int>[];
+    double? lastPeakValue;
 
-    for (var index = 1; index < _points.length - 1; index++) {
+    for (var index = _startIndex + 1; index < _points.length - 1; index++) {
       final previous = _points[index - 1];
       final current = _points[index];
       final next = _points[index + 1];
@@ -741,12 +824,14 @@ class WaveformBuffer {
       }
       if (peakTimes.isNotEmpty &&
           current.timestampMs - peakTimes.last < minPeakDistanceMs) {
-        if (current.value > _valueAtTimestamp(peakTimes.last)) {
+        if (lastPeakValue == null || current.value > lastPeakValue) {
           peakTimes[peakTimes.length - 1] = current.timestampMs;
+          lastPeakValue = current.value;
         }
         continue;
       }
       peakTimes.add(current.timestampMs);
+      lastPeakValue = current.value;
     }
 
     if (peakTimes.length < 2) {
@@ -769,36 +854,102 @@ class WaveformBuffer {
     return bpm;
   }
 
-  double _valueAtTimestamp(int timestampMs) {
-    for (final SamplePoint point in _points) {
-      if (point.timestampMs == timestampMs) {
-        return point.value;
-      }
-    }
-    return _points.last.value;
-  }
-
   void _trim() {
     const maxRetainedPoints = 60000;
-    if (_points.length <= maxRetainedPoints) {
+    const compactionThreshold = 12000;
+    final overflow = activeLength - maxRetainedPoints;
+    if (overflow <= 0) {
+      if (_startIndex >= compactionThreshold) {
+        _compact();
+      }
       return;
     }
-    final overflow = _points.length - maxRetainedPoints;
-    final removed = _points.take(overflow).toList();
-    for (final SamplePoint item in removed) {
+
+    var needsRangeRebuild = false;
+    for (var index = _startIndex; index < _startIndex + overflow; index++) {
+      final item = _points[index];
       _sum -= item.value;
       _sumSquares -= item.value * item.value;
+      if (item.value == _min || item.value == _max) {
+        needsRangeRebuild = true;
+      }
     }
-    _points.removeRange(0, overflow);
-    if (_points.isEmpty) {
+
+    _startIndex += overflow;
+    _summaryDirty = true;
+
+    if (!hasPoints) {
       _min = 0;
       _max = 0;
       _sum = 0;
       _sumSquares = 0;
+      _cachedSummary = null;
+      _cachedRateBpm = null;
+      _lastRateEstimateTimestampMs = 0;
+      _points.clear();
+      _startIndex = 0;
       return;
     }
-    _min = _points.map((SamplePoint item) => item.value).reduce(math.min);
-    _max = _points.map((SamplePoint item) => item.value).reduce(math.max);
+
+    if (needsRangeRebuild) {
+      _recomputeRange();
+    }
+    if (_startIndex >= compactionThreshold) {
+      _compact();
+    }
+  }
+
+  int _lowerBound(int timestampMs) {
+    var low = _startIndex;
+    var high = _points.length;
+    while (low < high) {
+      final mid = low + ((high - low) >> 1);
+      if (_points[mid].timestampMs < timestampMs) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
+  }
+
+  int _upperBound(int timestampMs) {
+    var low = _startIndex;
+    var high = _points.length;
+    while (low < high) {
+      final mid = low + ((high - low) >> 1);
+      if (_points[mid].timestampMs <= timestampMs) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
+  }
+
+  void _compact() {
+    if (_startIndex == 0) {
+      return;
+    }
+    _points.removeRange(0, _startIndex);
+    _startIndex = 0;
+  }
+
+  void _recomputeRange() {
+    if (!hasPoints) {
+      _min = 0;
+      _max = 0;
+      return;
+    }
+    var nextMin = _points[_startIndex].value;
+    var nextMax = nextMin;
+    for (var index = _startIndex + 1; index < _points.length; index++) {
+      final value = _points[index].value;
+      nextMin = math.min(nextMin, value);
+      nextMax = math.max(nextMax, value);
+    }
+    _min = nextMin;
+    _max = nextMax;
   }
 }
 

@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'models.dart';
 import 'monitor_controller.dart';
 
+const double _waveformYAxisWidth = 56;
+
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
 
@@ -326,6 +328,20 @@ class _DashboardPageState extends State<DashboardPage> {
               divisions: 18,
               onChanged: _controller.setSecondsPerScreen,
             ),
+            Text(
+              '实时延迟缓冲: ${_controller.liveDisplayLagSeconds.toStringAsFixed(1)} s',
+            ),
+            Slider(
+              value: _controller.liveDisplayLagSeconds,
+              min: 0,
+              max: 6,
+              divisions: 24,
+              onChanged: _controller.setLiveDisplayLagSeconds,
+            ),
+            const Text(
+              '实时播放会故意滞后一小段时间显示，并按最慢可见通道对齐右侧边界，以吸收传输延迟和抖动。',
+            ),
+            const SizedBox(height: 8),
             Text(_controller.isPaused ? '历史回滚: ${historySliderValue.toStringAsFixed(1)} s' : '历史回滚: 实时锁定'),
             Slider(
               value: historySliderValue,
@@ -580,9 +596,12 @@ class _DashboardPageState extends State<DashboardPage> {
                       return _ReportCard(report: _controller.report!);
                     }
                     final channel = _controller.visibleChannels[index];
+                    final waveform = _controller.visibleWaveform(channel.key);
                     return _WaveformCard(
                       channel: channel,
-                      points: _controller.visiblePoints(channel.key),
+                      points: waveform.points,
+                      minValue: waveform.minValue,
+                      maxValue: waveform.maxValue,
                       gain: _controller.gain,
                       secondsPerScreen: _controller.secondsPerScreen,
                       anchorTimestampMs: _controller.currentAnchorTimestampMs,
@@ -685,6 +704,8 @@ class _WaveformCard extends StatefulWidget {
   const _WaveformCard({
     required this.channel,
     required this.points,
+    required this.minValue,
+    required this.maxValue,
     required this.gain,
     required this.secondsPerScreen,
     required this.anchorTimestampMs,
@@ -693,6 +714,8 @@ class _WaveformCard extends StatefulWidget {
 
   final ChannelDescriptor channel;
   final List<SamplePoint> points;
+  final double minValue;
+  final double maxValue;
   final double gain;
   final double secondsPerScreen;
   final int anchorTimestampMs;
@@ -772,9 +795,12 @@ class _WaveformCardState extends State<_WaveformCard> {
                     child: Stack(
                       children: <Widget>[
                         Positioned.fill(
-                          child: CustomPaint(
+                          child: RepaintBoundary(
+                            child: CustomPaint(
                             painter: WaveformPainter(
                               points: widget.points,
+                              minValue: widget.minValue,
+                              maxValue: widget.maxValue,
                               color: colorFromHex(widget.channel.colorHex),
                               gain: widget.gain,
                               secondsPerScreen: widget.secondsPerScreen,
@@ -783,6 +809,7 @@ class _WaveformCardState extends State<_WaveformCard> {
                             child: widget.points.isEmpty
                                 ? const Center(child: Text('当前窗口暂无数据'))
                                 : const SizedBox.expand(),
+                          ),
                           ),
                         ),
                         if (_hoverInfo != null) ...<Widget>[
@@ -851,11 +878,19 @@ class _WaveformCardState extends State<_WaveformCard> {
 
     final windowMs = (widget.secondsPerScreen * 1000).round();
     final startMs = widget.anchorTimestampMs - windowMs;
-    final clampedDx = localPosition.dx.clamp(0.0, width);
-    final targetMs = startMs + (clampedDx / width * windowMs).round();
+    final chartWidth = math.max(1.0, width - _waveformYAxisWidth);
+    final clampedDx = (localPosition.dx - _waveformYAxisWidth).clamp(
+      0.0,
+      chartWidth,
+    );
+    final targetMs = startMs + (clampedDx / chartWidth * windowMs).round();
     final sample = _nearestSample(widget.points, targetMs);
-    final viewport = _WaveformViewport.fromPoints(widget.points);
-    final sampleDx = ((sample.timestampMs - startMs) / windowMs).clamp(0.0, 1.0) * width;
+    final viewport = _WaveformViewport.fromBounds(
+      minValue: widget.minValue,
+      maxValue: widget.maxValue,
+    );
+    final sampleDx = _waveformYAxisWidth +
+        ((sample.timestampMs - startMs) / windowMs).clamp(0.0, 1.0) * chartWidth;
     final sampleDy = viewport.dyForValue(value: sample.value, gain: widget.gain, height: height);
 
     return HoverSampleInfo(sample: sample, localDx: sampleDx, localDy: sampleDy);
@@ -934,6 +969,8 @@ class _WaveformCardState extends State<_WaveformCard> {
 class WaveformPainter extends CustomPainter {
   WaveformPainter({
     required this.points,
+    required this.minValue,
+    required this.maxValue,
     required this.color,
     required this.gain,
     required this.secondsPerScreen,
@@ -941,6 +978,8 @@ class WaveformPainter extends CustomPainter {
   });
 
   final List<SamplePoint> points;
+  final double minValue;
+  final double maxValue;
   final Color color;
   final double gain;
   final double secondsPerScreen;
@@ -952,13 +991,19 @@ class WaveformPainter extends CustomPainter {
     final gridPaint = Paint()
       ..color = const Color(0xFFD8E2DC)
       ..strokeWidth = 1;
+    final axisPaint = Paint()
+      ..color = const Color(0xFFA9BBB2)
+      ..strokeWidth = 1.2;
     final midlinePaint = Paint()
       ..color = const Color(0xFFB8C7C0)
       ..strokeWidth = 1.4;
     final signalPaint = Paint()
       ..color = color
-      ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
+      ..strokeWidth = 2.2
+      ..style = PaintingStyle.stroke
+      ..isAntiAlias = true
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round;
 
     final rect = Offset.zero & size;
     final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(14));
@@ -968,16 +1013,34 @@ class WaveformPainter extends CustomPainter {
 
     const verticalDivisions = 8;
     const horizontalDivisions = 6;
+    final chartLeft = _waveformYAxisWidth;
+    final chartWidth = math.max(1.0, size.width - chartLeft);
+    final chartRight = chartLeft + chartWidth;
+
+    canvas.drawLine(
+      Offset(chartLeft, 0),
+      Offset(chartLeft, size.height),
+      axisPaint,
+    );
+
     for (var i = 0; i <= verticalDivisions; i++) {
-      final dx = size.width * i / verticalDivisions;
+      final dx = chartLeft + chartWidth * i / verticalDivisions;
       canvas.drawLine(Offset(dx, 0), Offset(dx, size.height), gridPaint);
       final secondsLeft = secondsPerScreen - secondsPerScreen * i / verticalDivisions;
-      _drawLabel(canvas, size, text: '-${secondsLeft.toStringAsFixed(1)}s', offset: Offset(dx + 4, size.height - 18));
+      final labelDx = i == verticalDivisions
+          ? dx - 34
+          : dx + 4;
+      _drawLabel(
+        canvas,
+        size,
+        text: '-${secondsLeft.toStringAsFixed(1)}s',
+        offset: Offset(labelDx, size.height - 18),
+      );
     }
 
     for (var j = 0; j <= horizontalDivisions; j++) {
       final dy = size.height * j / horizontalDivisions;
-      canvas.drawLine(Offset(0, dy), Offset(size.width, dy), gridPaint);
+      canvas.drawLine(Offset(chartLeft, dy), Offset(chartRight, dy), gridPaint);
     }
 
     if (points.length < 2) {
@@ -985,25 +1048,120 @@ class WaveformPainter extends CustomPainter {
       return;
     }
 
-    final viewport = _WaveformViewport.fromPoints(points);
-    canvas.drawLine(Offset(0, size.height / 2), Offset(size.width, size.height / 2), midlinePaint);
-    _drawLabel(canvas, size, text: viewport.maxLabel.toStringAsFixed(2), offset: const Offset(8, 8));
-    _drawLabel(canvas, size, text: viewport.minLabel.toStringAsFixed(2), offset: Offset(8, size.height - 34));
+    final viewport = _WaveformViewport.fromBounds(
+      minValue: minValue,
+      maxValue: maxValue,
+    );
+    canvas.drawLine(
+      Offset(chartLeft, size.height / 2),
+      Offset(chartRight, size.height / 2),
+      midlinePaint,
+    );
+    for (var j = 0; j <= horizontalDivisions; j++) {
+      final ratio = 1 - (j / horizontalDivisions);
+      final labelValue = viewport.minLabel +
+          (viewport.maxLabel - viewport.minLabel) * ratio;
+      final dy = size.height * j / horizontalDivisions;
+      canvas.drawLine(
+        Offset(chartLeft - 6, dy),
+        Offset(chartLeft, dy),
+        axisPaint,
+      );
+      _drawLabel(
+        canvas,
+        size,
+        text: labelValue.toStringAsFixed(2),
+        offset: Offset(6, (dy - 7).clamp(2.0, size.height - 18)),
+      );
+    }
 
-    final startMs = anchorTimestampMs - (secondsPerScreen * 1000).round();
+    final windowMs = (secondsPerScreen * 1000).round();
+    final startMs = anchorTimestampMs - windowMs;
+    final renderPoints = _downsamplePoints(
+      points,
+      maxPoints: math.max(96, size.width.round() * 2),
+    );
     final path = Path();
-    for (var index = 0; index < points.length; index++) {
-      final point = points[index];
-      final dx = ((point.timestampMs - startMs) / (secondsPerScreen * 1000)) * size.width;
-      final dy = viewport.dyForValue(value: point.value, gain: gain, height: size.height);
-      if (index == 0) {
-        path.moveTo(dx, dy);
-      } else {
-        path.lineTo(dx, dy);
+    final offsets = renderPoints
+        .map(
+          (SamplePoint point) => Offset(
+            chartLeft + ((point.timestampMs - startMs) / windowMs) * chartWidth,
+            viewport.dyForValue(
+              value: point.value,
+              gain: gain,
+              height: size.height,
+            ),
+          ),
+        )
+        .toList(growable: false);
+    path.moveTo(offsets.first.dx, offsets.first.dy);
+    if (offsets.length == 2) {
+      path.lineTo(offsets.last.dx, offsets.last.dy);
+    } else {
+      for (var index = 1; index < offsets.length - 1; index++) {
+        final current = offsets[index];
+        final next = offsets[index + 1];
+        final control = Offset(
+          (current.dx + next.dx) / 2,
+          (current.dy + next.dy) / 2,
+        );
+        path.quadraticBezierTo(
+          current.dx,
+          current.dy,
+          control.dx,
+          control.dy,
+        );
       }
+      final last = offsets.last;
+      path.lineTo(last.dx, last.dy);
     }
     canvas.drawPath(path, signalPaint);
     canvas.restore();
+  }
+
+  List<SamplePoint> _downsamplePoints(
+    List<SamplePoint> source, {
+    required int maxPoints,
+  }) {
+    if (source.length <= maxPoints) {
+      return source;
+    }
+
+    final chunkSize = math.max(1, (source.length / maxPoints).ceil());
+    final reduced = <SamplePoint>[];
+    for (var start = 0; start < source.length; start += chunkSize) {
+      final end = math.min(source.length, start + chunkSize);
+      var minPoint = source[start];
+      var maxPoint = source[start];
+      for (var index = start + 1; index < end; index++) {
+        final point = source[index];
+        if (point.value < minPoint.value) {
+          minPoint = point;
+        }
+        if (point.value > maxPoint.value) {
+          maxPoint = point;
+        }
+      }
+      _appendUnique(reduced, source[start]);
+      if (minPoint.timestampMs <= maxPoint.timestampMs) {
+        _appendUnique(reduced, minPoint);
+        _appendUnique(reduced, maxPoint);
+      } else {
+        _appendUnique(reduced, maxPoint);
+        _appendUnique(reduced, minPoint);
+      }
+      _appendUnique(reduced, source[end - 1]);
+    }
+    return reduced;
+  }
+
+  void _appendUnique(List<SamplePoint> target, SamplePoint point) {
+    if (target.isNotEmpty &&
+        target.last.timestampMs == point.timestampMs &&
+        target.last.value == point.value) {
+      return;
+    }
+    target.add(point);
   }
 
   void _drawLabel(Canvas canvas, Size size, {required String text, required Offset offset}) {
@@ -1017,6 +1175,8 @@ class WaveformPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant WaveformPainter oldDelegate) {
     return oldDelegate.points != points ||
+        oldDelegate.minValue != minValue ||
+        oldDelegate.maxValue != maxValue ||
         oldDelegate.gain != gain ||
         oldDelegate.anchorTimestampMs != anchorTimestampMs ||
         oldDelegate.secondsPerScreen != secondsPerScreen ||
@@ -1030,12 +1190,13 @@ class _WaveformViewport {
   final double center;
   final double halfRange;
 
-  factory _WaveformViewport.fromPoints(List<SamplePoint> points) {
-    if (points.isEmpty) {
+  factory _WaveformViewport.fromBounds({
+    required double minValue,
+    required double maxValue,
+  }) {
+    if (minValue == 0 && maxValue == 0) {
       return const _WaveformViewport(center: 0, halfRange: 1);
     }
-    final minValue = points.map((SamplePoint item) => item.value).reduce(math.min);
-    final maxValue = points.map((SamplePoint item) => item.value).reduce(math.max);
     final center = (minValue + maxValue) / 2;
     var halfRange = (maxValue - minValue) / 2;
     if (halfRange.abs() < 0.0001) {

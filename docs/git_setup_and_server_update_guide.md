@@ -317,7 +317,7 @@ mv cardio-monitor cardio-monitor_backup_20260419
 cd /root
 git clone 你的仓库地址 cardio-monitor
 ```
-
+https://github.com/MisakuraPW/cardio-monitor
 这条命令的作用：
 
 - 从 GitHub 拉取一份新的、干净的工作区
